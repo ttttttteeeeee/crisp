@@ -2,15 +2,25 @@ const http = require("node:http");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
+const { createStore } = require("./store.js");
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, "data");
+const DATA_DIR = process.env.CRISP_DATA_DIR ? path.resolve(process.env.CRISP_DATA_DIR) : path.join(ROOT, "data");
 const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_RESPONSE_BYTES = Number(process.env.CRISP_MAX_RESPONSE_BYTES || 10 * 1024 * 1024);
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost"]);
 const MAX_LOG_ENTRIES = 100;
 const METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "ALL"]);
+// Added on first start so the bookstore's "Discover more" search works out of the box.
+const DEFAULT_ENDPOINTS = [{
+  name: "Open Library search",
+  method: "GET",
+  path: "/discover",
+  upstreamUrl: "https://openlibrary.org/search.json",
+}];
 const logs = [];
 
 let config = { repository: null, endpoints: [] };
@@ -21,24 +31,30 @@ function jsonResponse(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
 async function readJson(req) {
+  // Browsers can send text/plain or form bodies cross-site without a CORS preflight.
+  // Requiring application/json forces a preflight, which this server never approves.
+  const contentType = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+  if (contentType !== "application/json") {
+    throw httpError(415, "Content-Type must be application/json.");
+  }
   let size = 0;
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY_BYTES) {
-      const error = new Error("Request body exceeds the 1 MB limit.");
-      error.status = 413;
-      throw error;
-    }
+    if (size > MAX_BODY_BYTES) throw httpError(413, "Request body exceeds the 1 MB limit.");
     chunks.push(chunk);
   }
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
-    const error = new Error("Request body must be valid JSON.");
-    error.status = 400;
-    throw error;
+    throw httpError(400, "Request body must be valid JSON.");
   }
 }
 
@@ -95,6 +111,26 @@ function routeMatches(routePath, requestPath) {
     }
   }
   return params;
+}
+
+// The server listens on loopback only, but a web page in the user's own browser can still
+// reach it. Reject requests whose Host is not a loopback name (DNS rebinding) and admin
+// requests that come from any other site (cross-site request forgery).
+function hostIsLoopback(hostHeader, port) {
+  if (typeof hostHeader !== "string") return false;
+  const match = hostHeader.toLowerCase().match(/^([a-z0-9.-]+)(?::(\d+))?$/);
+  if (!match || !LOOPBACK_HOSTNAMES.has(match[1])) return false;
+  return match[2] === undefined ? port === 80 : Number(match[2]) === port;
+}
+
+function originIsAllowed(originHeader, port) {
+  if (originHeader === undefined) return true; // Non-browser clients such as curl send no Origin.
+  try {
+    const origin = new URL(originHeader);
+    return origin.protocol === "http:" && hostIsLoopback(origin.host, port);
+  } catch {
+    return false;
+  }
 }
 
 function addLog(entry) {
@@ -221,8 +257,21 @@ async function handleAdmin(req, res, url) {
   return jsonResponse(res, 404, { error: "Admin API route not found." });
 }
 
+function safeDecodeComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 async function proxyRequest(req, res, url) {
-  const requestPath = decodeURI(url.pathname.slice("/gateway".length)) || "/";
+  let requestPath;
+  try {
+    requestPath = decodeURI(url.pathname.slice("/gateway".length)) || "/";
+  } catch {
+    return jsonResponse(res, 400, { error: "The request path is not valid URL encoding." });
+  }
   const endpoint = config.endpoints.find(item => {
     const methodMatches = item.method === "ALL" || item.method === req.method;
     return methodMatches && routeMatches(item.path, requestPath) !== null;
@@ -234,7 +283,7 @@ async function proxyRequest(req, res, url) {
   const params = routeMatches(endpoint.path, requestPath);
   let upstreamUrl = endpoint.upstreamUrl;
   for (const [key, value] of Object.entries(params)) {
-    upstreamUrl = upstreamUrl.replaceAll(`{${key}}`, encodeURIComponent(decodeURIComponent(value)));
+    upstreamUrl = upstreamUrl.replaceAll(`{${key}}`, encodeURIComponent(safeDecodeComponent(value)));
   }
   const target = new URL(upstreamUrl);
   url.searchParams.forEach((value, key) => target.searchParams.append(key, value));
@@ -254,25 +303,41 @@ async function proxyRequest(req, res, url) {
       redirect: "manual",
       signal: AbortSignal.timeout(15000),
     });
+    const declaredLength = Number(upstreamResponse.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+      await upstreamResponse.body?.cancel();
+      throw httpError(502, "The upstream response is larger than the gateway allows.");
+    }
     const responseHeaders = {};
     for (const [name, value] of upstreamResponse.headers) {
-      if (!["connection", "transfer-encoding", "content-encoding", "content-length"].includes(name.toLowerCase())) {
+      if (!["connection", "transfer-encoding", "content-encoding", "content-length", "set-cookie"].includes(name.toLowerCase())) {
         responseHeaders[name] = value;
       }
     }
     res.writeHead(upstreamResponse.status, responseHeaders);
+    let truncated = false;
     if (req.method === "HEAD" || !upstreamResponse.body) {
       res.end();
     } else {
-      const bodyBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
-      res.end(bodyBuffer);
+      // Stream instead of buffering, and stop if the body grows past the limit.
+      let received = 0;
+      for await (const chunk of upstreamResponse.body) {
+        received += chunk.length;
+        if (received > MAX_RESPONSE_BYTES) {
+          truncated = true;
+          break;
+        }
+        if (!res.write(chunk)) await new Promise(resolve => res.once("drain", resolve));
+      }
+      if (truncated) res.destroy();
+      else res.end();
     }
-    addLog({ method: req.method, path: requestPath, status: upstreamResponse.status, durationMs: Date.now() - startedAt });
+    addLog({ method: req.method, path: requestPath, status: truncated ? 502 : upstreamResponse.status, durationMs: Date.now() - startedAt });
   } catch (error) {
     const status = error.status || (error.name === "TimeoutError" || error.name === "AbortError" ? 504 : 502);
     addLog({ method: req.method, path: requestPath, status, durationMs: Date.now() - startedAt });
-    if (!res.headersSent) jsonResponse(res, status, { error: status === 413 ? error.message : "The upstream request failed or timed out." });
-    else res.end();
+    if (!res.headersSent) jsonResponse(res, status, { error: error.status ? error.message : "The upstream request failed or timed out." });
+    else res.destroy();
   }
 }
 
@@ -281,19 +346,30 @@ async function readBodyBuffer(req) {
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY_BYTES) {
-      const error = new Error("Request body exceeds the 1 MB limit.");
-      error.status = 413;
-      throw error;
-    }
+    if (size > MAX_BODY_BYTES) throw httpError(413, "Request body exceeds the 1 MB limit.");
     chunks.push(chunk);
   }
   return chunks.length ? Buffer.concat(chunks) : undefined;
 }
 
 async function serve(req, res) {
-  const url = new URL(req.url, `http://${HOST}:${PORT}`);
-  if (url.pathname.startsWith("/api/")) return handleAdmin(req, res, url);
+  const port = req.socket.localPort;
+  if (!hostIsLoopback(req.headers.host, port)) {
+    return jsonResponse(res, 421, { error: "This gateway only answers requests addressed to 127.0.0.1 or localhost." });
+  }
+  const url = new URL(req.url, `http://${HOST}:${port}`);
+  if (url.pathname.startsWith("/store/api/")) {
+    if (!originIsAllowed(req.headers.origin, port)) {
+      return jsonResponse(res, 403, { error: "Store requests from other sites are not allowed." });
+    }
+    return store.handle(req, res, url);
+  }
+  if (url.pathname.startsWith("/api/")) {
+    if (!originIsAllowed(req.headers.origin, port)) {
+      return jsonResponse(res, 403, { error: "Admin requests from other sites are not allowed." });
+    }
+    return handleAdmin(req, res, url);
+  }
   if (url.pathname === "/gateway" || url.pathname.startsWith("/gateway/")) return proxyRequest(req, res, url);
   if (req.method !== "GET" && req.method !== "HEAD") return jsonResponse(res, 405, { error: "Method not allowed." });
   const pages = {
@@ -311,27 +387,55 @@ async function serve(req, res) {
   res.end(page);
 }
 
-async function start() {
+const store = createStore({
+  catalogFile: path.join(ROOT, "books.json"),
+  dataDir: DATA_DIR,
+  readJson,
+  jsonResponse,
+  httpError,
+});
+
+async function loadConfig() {
+  config = { repository: null, endpoints: [] };
   try {
     const saved = JSON.parse(await fs.readFile(CONFIG_FILE, "utf8"));
     if (Array.isArray(saved.endpoints)) config.endpoints = saved.endpoints.filter(endpoint => !validateEndpoint(endpoint));
     if (saved.repository && typeof saved.repository.fullName === "string") config.repository = saved.repository;
   } catch (error) {
     if (error.code !== "ENOENT") throw new Error(`Could not load gateway config: ${error.message}`);
+    config.endpoints = DEFAULT_ENDPOINTS.map(endpoint => ({ ...endpoint, id: randomUUID(), createdAt: new Date().toISOString() }));
+    await saveConfig();
   }
-  const server = http.createServer((req, res) => {
+}
+
+function createServer() {
+  return http.createServer((req, res) => {
     serve(req, res).catch(error => {
-      console.error("Request failed:", error);
+      if (!error.status) console.error("Request failed:", error);
       if (!res.headersSent) jsonResponse(res, error.status || 500, { error: error.status ? error.message : "Internal server error." });
       else res.end();
     });
   });
-  server.listen(PORT, HOST, () => {
-    console.log(`Crisp API Gateway running at http://${HOST}:${PORT}`);
-  });
 }
 
-start().catch(error => {
-  console.error(error.message);
-  process.exitCode = 1;
-});
+async function start(port = PORT) {
+  await loadConfig();
+  await store.load();
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, HOST, resolve);
+  });
+  return server;
+}
+
+if (require.main === module) {
+  start()
+    .then(server => console.log(`Crisp API Gateway running at http://${HOST}:${server.address().port}`))
+    .catch(error => {
+      console.error(error.message);
+      process.exitCode = 1;
+    });
+}
+
+module.exports = { start, validRoutePath, validateEndpoint, routeMatches, hostIsLoopback, originIsAllowed };

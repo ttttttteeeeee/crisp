@@ -4,7 +4,9 @@
   "private": true,
   "description": "A local GitHub-connected API gateway with configurable proxy routes",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/*.test.js",
+    "check": "node --check server.js"
   },
   "engines": {
     "node": ">=18"
